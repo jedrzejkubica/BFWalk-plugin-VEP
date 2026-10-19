@@ -32,4 +32,4 @@ run VEP on example data:
 
 run vep in the same dir as BFWalk.pm, scores.tsv and uniprot_parsed.tsv
 
-`vep -i test.vcf.gz -o test4.out --cache /home/nthierry/.vep/ --offline --dir_plugins /home/kubicaj/BFWalk-plugin-VEP/ --plugin BFWalk,file=scores_MMAF.tsv,map=uniprot_parsed.tsv,label=MMAF`
+`vep -i test.vcf.gz -o test.out --cache /home/nthierry/.vep/ --offline --dir_plugins /home/kubicaj/BFWalk-plugin-VEP/ --plugin BFWalk,file=MMAF:scores_MMAF.tsv,file=NOA:scores_NOA.tsv`

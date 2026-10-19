@@ -27,151 +27,302 @@ BFWalk - Add BFWalk score to the output
 =head1 SYNOPSIS
 
  python BFWalk.py --network interactome.sif --seeds seeds.txt 1>scores.tsv
- ./vep -i variants.vcf --plugin BFWalk,file=scores.tsv,map=uniprot_parsed.tsv
- ./vep -i variants.vcf --plugin BFWalk,file=scores.tsv,map=uniprot_parsed.tsv,label=MMAF
+ ./vep -i variants.vcf --plugin BFWalk,file=scores.tsv
+ ./vep -i variants.vcf --plugin BFWalk,file=MMAF:scores_MMAF.tsv,file=NOA:scores_NOA.tsv
 
 =head1 DESCRIPTION
- 
- 
- An Ensembl VEP plugin that adds BFWalk scores to transcript-level output.
+
+
+ An Ensembl VEP plugin that adds BFWalk scores to VEP output.
  BFWalk (https://github.com/jedrzejkubica/BFWalk) is a network-propagation
  algorithm based on non-backtracking walks. It scores every protein in an
  interactome by its proximity to a set of seeds (e.g. known phenotype-associated
  genes/proteins). Higher scores mean more likely to be associated with the phenotype.
 
- Scores depend on the seed set. Re-run BFWalk for each phenotype, and use
- label= to run the plugin several times in one VEP command.
+ Scores depend on the seed set. Run BFWalk once per phenotype, then give
+ the plugin one file= per phenotype. Each phenotype gets its own column.
 
- BFWalk scores UniProt proteins when run on the interactome.
- The plugin maps UniProt ACs to genes with the
- uniprot_parsed.tsv file produced by BFWalk's Interactome/uniprot_parser.py
- (columns PrimaryAC, SecondaryACs, TaxID, GeneName, Synonyms). Use the same
- file that was used to build the interactome.
+ BFWalk scores UniProt proteins when run on the interactome. The plugin
+ matches them to transcripts using the UniProt/Swiss-Prot accessions that
+ Ensembl stores for each transcript's protein product in the VEP cache.
+ Accession versions (P04637.293) and isoform suffixes
+ (P04637-2) are ignored when matching.
 
- Parameters (key=value, comma-separated):
-   file=FILE      BFWalk scores with header NODE\tSCORE (required)
-   map=FILE       uniprot_parsed.tsv (required)
-   label=NAME     column prefix becomes BFWalk_NAME_ (optional)
-   format=FMT     sprintf format for scores, default %.3g
+ Scores are reported per transcript: only transcripts whose
+ protein product has a Swiss-Prot accession can receive a score.
+ Non-coding transcripts, and coding transcripts that Ensembl maps only to
+ TrEMBL, get no value. If a transcript has several Swiss-Prot accessions,
+ the highest score is reported.
+
+ Parameters:
+   file=PHENOTYPE:FILE  BFWalk scores with header NODE\tSCORE for phenotype (PHENOTYPE).
+   format=FMT      sprintf format for scores, default %.3g
 
  Output columns:
-   BFWalk_score    BFWalk score for the gene
+   BFWalk_NAME_score   BFWalk score for the transcript's protein, one column per phenotype
+   BFWalk_score        the same, when a single file is given without a name
+
+ Examples:
+   --plugin BFWalk,file=scores.tsv
+   --plugin BFWalk,file=MMAF:scores_MMAF.tsv,file=NOA:scores_NOA.tsv
+
+ Requires a VEP cache (or database) that includes UniProt annotation,
+ which the standard Ensembl human caches do.
 
 
 =cut
-
+ 
 package BFWalk;
-
+ 
 use strict;
 use warnings;
-
+ 
 use base qw(Bio::EnsEMBL::Variation::Utils::BaseVepPlugin);
-
-my $SCORE_DESC = 'BFWalk score (interactome-based, higher means closer more likely to be associated with the phenotype)';
-
+ 
+my $COLUMN_DESCRIPTION = "BFWalk score of the transcript's Swiss-Prot protein (higher means closer to the seed proteins)";
+my $DEFAULT_SCORE_FORMAT = '%.3g';
+ 
+ 
+# new() is called once, when VEP starts.
+# It reads all score files into memory, so that run() only has to look up values.
 sub new {
   my $class = shift;
-  my $self  = $class->SUPER::new(@_);
-
-  my $p = $self->params_to_hash();
-  my $file    = $p->{file} or die "ERROR: BFWalk requires file=<BFWalk scores.tsv>\n";
-  my $map     = $p->{map}  or die "ERROR: BFWalk requires map=<uniprot_parsed.tsv>\n";
-  my $format  = $p->{format} // '%.3g';
-
-  for my $f (grep { defined } $file, $map) {
-    die "ERROR: BFWalk file '$f' not found\n" unless -e $f;
-  }
-
-  $self->{column} = (defined $p->{label} ? "BFWalk_$p->{label}" : 'BFWalk') . '_score';
-
-
-  # BFWalk scores: parse UniProt AC to score
-  my %prot_score;
-  open my $fh, '<', $file or die "ERROR: cannot open $file: $!\n";
-
-  my $hdr = <$fh>;
-  die "ERROR: BFWalk: $file is empty\n" unless defined $hdr;
-  chomp $hdr;
-  my %scol; my $i = 0;
-  $scol{uc $_} = $i++ for split /\t/, $hdr;
-  for (qw(NODE SCORE)) {
-    die "ERROR: BFWalk: column '$_' not found in header of $file\n" unless exists $scol{$_};
-  }
-
-  my $n_bad = 0;
-  while (my $line = <$fh>) {
-    chomp $line;
-    next unless length $line;
-    my @f = split /\t/, $line;
-    my ($ac, $score) = @f[$scol{NODE}, $scol{SCORE}];
-    unless (defined $ac && defined $score && $score =~ /^-?[\d.]+(?:e[-+]?\d+)?$/i) {
-      $n_bad++;
-      next;
+  my $self = $class->SUPER::new(@_);
+ 
+  # VEP's params_to_hash() keeps only the last value of a repeated key,
+  # but file= is given once per phenotype, so we read the parameters ourselves.
+  my @file_parameters = ();
+  my $score_format = $DEFAULT_SCORE_FORMAT;
+ 
+  foreach my $parameter (@{ $self->params() }) {
+    my ($key, $value) = split(/=/, $parameter, 2);
+ 
+    if (!defined($value) || $value eq '') {
+      die("ERROR: BFWalk: parameters must be key=value, got '$parameter'\n");
     }
-    $ac =~ s/-\d+$//;
-    $prot_score{uc $ac} = $score;
+ 
+    if ($key eq 'file') {
+      push(@file_parameters, $value);
+    }
+    elsif ($key eq 'format') {
+      $score_format = $value;
+    }
+    else {
+      die("ERROR: BFWalk: unknown parameter '$key' (expected file, format)\n");
+    }
   }
-  close $fh;
-
-  warn "WARNING: BFWalk: skipped $n_bad malformed lines in $file\n" if $n_bad;
-  die "ERROR: no scores read from $file\n" unless %prot_score;
-
-  # uniprot_parsed.tsv: parse the UniProt AC to gene name mapping
-  my %ac2gene;
-  open my $mh, '<', $map or die "ERROR: cannot open $map: $!\n";
-  my $mhdr = <$mh>;
-  die "ERROR: BFWalk: $map is empty\n" unless defined $mhdr;
-  chomp $mhdr;
-  my %col; $i = 0;
-  $col{$_} = $i++ for split /\t/, $mhdr;
-  for (qw(PrimaryAC TaxID GeneName Synonyms)) {
-    die "ERROR: BFWalk: column '$_' not found in $map header\n" unless exists $col{$_};
+ 
+  if (scalar(@file_parameters) == 0) {
+    die("ERROR: BFWalk requires at least one file=PHENOTYPE:FILE\n");
   }
-  while (my $line = <$mh>) {
-    chomp $line;
-    my @f = split /\t/, $line, -1;
-    next unless ($f[$col{TaxID}] // '') =~ /\b9606\b/;
-    my $gene = lc($f[$col{GeneName}] // '');
-    next unless length $gene;
-    my $ac = uc($f[$col{PrimaryAC}] // '');
-    $ac2gene{$ac} = $gene if exists $prot_score{$ac};
+ 
+  $self->{score_format} = $score_format;
+ 
+  # Scores from all phenotypes are stored in a single table, keyed by protein:
+  #   $self->{scores_by_protein}{UniProt accession}{output column name} = score
+  # so that run() can find every phenotype's score for a protein with one lookup.
+  $self->{scores_by_protein} = {};
+  $self->{column_names} = [];
+ 
+  foreach my $file_parameter (@file_parameters) {
+    my $phenotype;
+    my $scores_file;
+ 
+    if ($file_parameter =~ /^(\w+):(.+)$/) {
+      $phenotype = $1;
+      $scores_file = $2;
+    }
+    else {
+      $scores_file = $file_parameter;
+    }
+ 
+    # Without a phenotype the column is just "BFWalk_score".
+    # With several files, every file needs its own phenotype,
+    # otherwise they would all write into the same column.
+    my $column_name;
+    if (defined($phenotype)) {
+      $column_name = "BFWalk_" . $phenotype . "_score";
+    }
+    elsif (scalar(@file_parameters) == 1) {
+      $column_name = "BFWalk_score";
+    }
+    else {
+      die("ERROR: BFWalk: with several files, each needs a phenotype: file=PHENOTYPE:FILE ('$file_parameter')\n");
+    }
+ 
+    foreach my $existing_column_name (@{ $self->{column_names} }) {
+      if ($existing_column_name eq $column_name) {
+        die("ERROR: BFWalk: phenotype '$phenotype' used twice\n");
+      }
+    }
+ 
+    if (!-e $scores_file) {
+      die("ERROR: BFWalk file '$scores_file' not found\n");
+    }
+ 
+    my $score_by_protein = read_scores_file($scores_file);
+ 
+    foreach my $protein (keys(%{$score_by_protein})) {
+      $self->{scores_by_protein}{$protein}{$column_name} = $score_by_protein->{$protein};
+    }
+ 
+    push(@{ $self->{column_names} }, $column_name);
   }
-  close $mh;
-
-  # map UniProt ACs to genes
-  my %raw;
-  for my $ac (keys %prot_score) {
-    my $g = $ac2gene{$ac} // next;
-    $raw{$g} = $prot_score{$ac}
-      if !exists $raw{$g} || $prot_score{$ac} > $raw{$g};
-  }
-  my $n_unmapped = grep { !exists $ac2gene{$_} } keys %prot_score;
-  warn sprintf("WARNING: BFWalk: %d of %d proteins have no human gene in %s\n",
-               $n_unmapped, scalar keys %prot_score, $map) if $n_unmapped;
-  die "ERROR: BFWalk: no proteins could be mapped to genes using $map\n" unless %raw;
-
-
-  $self->{scores} = { map { $_ => sprintf($format, $raw{$_}) } keys %raw };
-
+ 
   return $self;
 }
-
+ 
+ 
+# Reads one BFWalk scores file and returns a reference to a hash:
+#   { UniProt accession => score }
+# The file must have a header line with the columns NODE and SCORE.
+sub read_scores_file {
+  my ($scores_file) = @_;
+ 
+  open(my $file_handle, '<', $scores_file) or die("ERROR: cannot open $scores_file: $!\n");
+ 
+  my $header_line = <$file_handle>;
+  if (!defined($header_line)) {
+    die("ERROR: BFWalk: $scores_file is empty\n");
+  }
+  chomp($header_line);
+ 
+  # Find the columns by name rather than by position,
+  # so the file still works if the columns are in another order.
+  my @header_columns = split(/\t/, $header_line);
+  my $node_column_index;
+  my $score_column_index;
+ 
+  for (my $index = 0; $index < scalar(@header_columns); $index++) {
+    my $column_title = uc($header_columns[$index]);
+    if ($column_title eq 'NODE') {
+      $node_column_index = $index;
+    }
+    elsif ($column_title eq 'SCORE') {
+      $score_column_index = $index;
+    }
+  }
+ 
+  if (!defined($node_column_index)) {
+    die("ERROR: BFWalk: column 'NODE' not found in header of $scores_file\n");
+  }
+  if (!defined($score_column_index)) {
+    die("ERROR: BFWalk: column 'SCORE' not found in header of $scores_file\n");
+  }
+ 
+  my %score_by_protein = ();
+  my $number_of_malformed_lines = 0;
+ 
+  while (my $line = <$file_handle>) {
+    chomp($line);
+ 
+    if ($line eq '') {
+      next;
+    }
+ 
+    my @fields = split(/\t/, $line);
+    my $protein = $fields[$node_column_index];
+    my $score = $fields[$score_column_index];
+ 
+    # Accept plain numbers and scientific notation (e.g. 1.2e-05).
+    # Anything else is counted and reported once, instead of being silently ignored.
+    if (!defined($protein) || !defined($score) || $score !~ /^-?[\d.]+(e[-+]?\d+)?$/i) {
+      $number_of_malformed_lines++;
+      next;
+    }
+ 
+    $score_by_protein{ normalise_accession($protein) } = $score;
+  }
+ 
+  close($file_handle);
+ 
+  if ($number_of_malformed_lines > 0) {
+    warn("WARNING: BFWalk: skipped $number_of_malformed_lines malformed lines in $scores_file\n");
+  }
+  if (scalar(keys(%score_by_protein)) == 0) {
+    die("ERROR: no scores read from $scores_file\n");
+  }
+ 
+  return \%score_by_protein;
+}
+ 
+ 
+# The VEP cache stores versioned accessions (P04637.293) and BFWalk nodes may
+# be isoforms (P04637-2), while the interactome is built on plain accessions.
+# Removing both suffixes lets the two sources match.
+sub normalise_accession {
+  my ($accession) = @_;
+ 
+  $accession = uc($accession);
+  $accession =~ s/\.\d+$//;
+  $accession =~ s/-\d+$//;
+ 
+  return $accession;
+}
+ 
+ 
+# Tells VEP to call run() only for variants overlapping transcripts,
+# since only transcripts have a protein product to look up.
 sub feature_types {
   return ['Transcript'];
 }
-
+ 
+ 
+# Tells VEP which columns this plugin adds, so it can describe them
+# in the output header (and in the CSQ field description for VCF output).
 sub get_header_info {
   my $self = shift;
-  return { $self->{column} => $SCORE_DESC };
+ 
+  my %column_descriptions = ();
+  foreach my $column_name (@{ $self->{column_names} }) {
+    $column_descriptions{$column_name} = $COLUMN_DESCRIPTION;
+  }
+ 
+  return \%column_descriptions;
 }
-
+ 
+ 
+# run() is called once per variant allele and overlapping transcript.
+# It returns a hash of { column name => value }, which VEP adds to that output row.
+# An empty hash means: add nothing to this row.
 sub run {
-  my ($self, $tva) = @_;
-  my $tr  = $tva->transcript or return {};
-  my $key = $tr->{_gene_symbol} || $tr->{_gene_hgnc} or return {};
-  $key = lc $key;
-  return {} unless exists $self->{scores}{$key};
-  return { $self->{column} => $self->{scores}{$key} };
+  my ($self, $transcript_variation_allele) = @_;
+ 
+  my $transcript = $transcript_variation_allele->transcript();
+  if (!defined($transcript)) {
+    return {};
+  }
+ 
+  # The VEP cache stores the Swiss-Prot accession(s) of the transcript's protein
+  # as a comma-separated string. Transcripts without one have no value or '-'.
+  my $swissprot_accessions = $transcript->{_swissprot};
+  if (!defined($swissprot_accessions) || $swissprot_accessions eq '' || $swissprot_accessions eq '-') {
+    return {};
+  }
+ 
+  # A transcript can have several accessions; for each phenotype keep the highest score.
+  my %highest_score_by_column = ();
+ 
+  foreach my $accession (split(/,/, $swissprot_accessions)) {
+    my $scores_by_column = $self->{scores_by_protein}{ normalise_accession($accession) };
+    if (!defined($scores_by_column)) {
+      next;
+    }
+ 
+    foreach my $column_name (keys(%{$scores_by_column})) {
+      my $score = $scores_by_column->{$column_name};
+      if (!exists($highest_score_by_column{$column_name}) || $score > $highest_score_by_column{$column_name}) {
+        $highest_score_by_column{$column_name} = $score;
+      }
+    }
+  }
+ 
+  my %output = ();
+  foreach my $column_name (keys(%highest_score_by_column)) {
+    $output{$column_name} = sprintf($self->{score_format}, $highest_score_by_column{$column_name});
+  }
+ 
+  return \%output;
 }
-
+ 
 1;
